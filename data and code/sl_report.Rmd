@@ -198,8 +198,3 @@ Dropping the threshold to 0.3 picks up a bigger share of real positive responses
 # Conclusions
 Using the same marketing approach for everyone is a waste of time. The clustering shows three different spending groups, so we need different strategies. Plus, the random forest model proves that recent engagement beats demographic guesses. By running contact lists through this model—focusing on recency and past actions—marketing teams can drop acquisition costs and put their effort into the groups most likely to convert.
 
-\newpage
-
-# Appendix: r code
-```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
-```
