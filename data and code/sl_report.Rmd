@@ -1,0 +1,212 @@
+---
+title: "Customer personality analysis: segmenting and predicting behavior"
+author: |
+  | Ciaboco Alessandro
+  | Matricola: 68530A
+date: "May 2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.align='center', fig.width=7, fig.height=4.5)
+
+library(dplyr)
+library(ggplot2)
+library(factoextra)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(nnet)
+
+# Data loading and cleaning
+df=read.csv("marketing_campaign.csv",sep="\t",stringsAsFactors=TRUE)
+df=df%>%
+  mutate(
+    Age=2026-Year_Birth,
+    TotalSpent=MntWines+MntFruits+MntMeatProducts+MntFishProducts+MntSweetProducts+MntGoldProds,
+    ResponseTarget=as.factor(ifelse(Response==1,"Yes","No")))%>%
+  filter(Income<600000,Age<100)%>%
+  tidyr::drop_na(Income)
+
+df_clean=df%>%
+  select(-ID,-Z_CostContact,-Z_Revenue,-Year_Birth,-Dt_Customer,-Response)
+
+num_vars=df_clean%>%
+  select_if(is.numeric)%>%
+  select(-starts_with("Accepted"),-Complain)
+scaled_data=scale(num_vars)
+```
+
+\vspace*{1.5cm}
+\begin{center}
+\textbf{\Large Abstract}
+
+\vspace{0.5cm}
+
+The goal is to optimize the marketing budget finding high-value customers. By looking at old retail data I found buying patterns to make a predictive model: first I used PCA and k-means clustering to split the customers into different economic groups, then I trained and checked a few models (logistic regression, lasso, random forest, ANN) to predict how customers will react to a new campaign. In the end, the models show we can cut costs by only targeting people who are likely to buy.
+\end{center}
+\vspace*{\fill}
+\newpage
+
+# Dataset structure
+The data set is very well structured with 29 variables, i grouped the variables into four main groups in order to be able to analyze it better:
+
+* Demographics: basic info like age (taking into consideration only the year), income, relationship status, and dependents.
+* Product spending: I computed one variable called `TotalSpent` composed by things like wine, meat, and sweets to see overall buying power.
+* Channel engagement: metrics on how people interact with the store, comparing web visits to real purchases in-store or from a catalog.
+* Campaign history: past records of who accepted old marketing offers, to be able to see which kind of customer accepted it in the past.
+
+# Data cleaning
+Data cleaning was needed to make the model work better and remove bias:
+
+1. Missing data: rows without an income value were removed, guessing the income might add bias, especially if the missing it's not imputated to something, so deleting them is safer.
+2. Extreme outliers: some records had birth years like 1893, incomes were over 600,000 and other similiar outliers, so I capped age at 100 and income at 600k so they don't mess up the model.
+3. Zero-variance features: the variables `Z_CostContact` and `Z_Revenue` had the same value in every row, since they don't help predict anything, I deleted them.
+4. Administrative variables: customer ID and join dates were dropped so the algorithms don't try to find fake links or correlation between id and spending behaviour.
+
+\newpage
+
+# Part 1: unsupervised learning
+
+## Principal component analysis (PCA)
+Since there are a lot of variable that are very similar to each other, I ran a Principal Component Analysis on the standardized numeric variables, excluding binary and campaign flags,to find out which variables explain the most variance: 
+
+```{r pca-analysis}
+pca_res=prcomp(scaled_data,center=FALSE,scale.=FALSE)
+fviz_pca_var(pca_res,col.var="contrib",
+             gradient.cols=c("#00AFBB","#E7B800","#FC4E07"),
+             repel=TRUE,select.var=list(contrib=10))+
+  labs(title="PCA: top 10 variable contributions")
+```
+
+The first principal component explains 42.1% of the total variance, while the second one adds another 11.6%, together they capture more than half of the information, so the biplot gives a good interpretation of how the variables relate.
+
+Arrows pointing in the same direction mean the variables are positively correlated, while opposite directions mean negative correlation, the color scale shows how much each variable contributes to the components. Warmer colors indicate higher contributions. Money variables (income, TotalSpent, meat, and wine) all point strongly to the right along PC1: that means they all push variance in the same direction and represent higher economic power. On the other side, `NumWebVisitsMonth` points left, opposite to the spending variables: this means there is an inverse link, the people who visit the site most are often the ones who spend the least, this pattern is not obvious at first glance but turns out to be a key finding that reappears later in the clustering.
+
+\newpage
+
+## Clustering analysis
+To find the best number of customer segments, I checked the within-cluster sum of squares elbow curve:
+
+```{r elbow-method, fig.height=3.5}
+fviz_nbclust(scaled_data,kmeans,method="wss")+labs(title="Elbow method for optimal k")
+```
+
+The elbow curve points to k=3 as the sweet spot, the drop in WSS flattens after three clusters. Adding more clusters would give only a marginal improvement while making the segments harder to interpret; lowering k could give lower complexity but it would make the cluster more useless, so i choose k=3 as an in the middle choice. I ran k-means with three centers, and to be sure it wasn't a fluke, I checked the results against a hierarchical dendrogram (Ward's method).
+
+```{r kmeans-analysis, fig.height=3.5, fig.width=5.5}
+# K-means analysis
+set.seed(123)
+km_res=kmeans(scaled_data,centers=3,nstart=25)
+fviz_cluster(km_res,data=scaled_data,geom="point", ellipse.type="convex",ggtheme=theme_minimal())+labs(title="K-means clustering (k=3)")
+
+dist_mat=dist(scaled_data,method="euclidean")
+hc_res=hclust(dist_mat,method="ward.D2")
+plot(hc_res,labels=FALSE,hang=-1,main="Hierarchical clustering dendrogram")
+rect.hclust(hc_res,k=3,border=2:4)
+```
+
+Both clustering methods match up well: the k-means plot projects the data onto the first two principal components (the axes are the same PC1 and PC2 we saw in the biplot), the three clusters show up as clearly separated clouds, with the convex hulls around each group barely touching. This tells us the segments are well defined and not just noisy groupings. On the right side, with high PC1 values, we see the cluster of customers who spend a lot and have high income, on the left low PC1 values belong to the high-web-visit, low-spending cluster while the middle cluster sits in between. The dendrogram, also splits the data naturally into three tall branches, the large vertical gap before any further split confirms that three clusters capture the main structure of the data. adding another subdivisions would be forced.
+
+The table below puts actual numbers behind these labels, giving each segment a clear economic profile to analyze in orther to create clear marketing choices:
+
+```{r cluster-profile}
+# Cluster profiling: average values per segment
+df_clean%>%
+  mutate(Cluster=as.factor(km_res$cluster))%>%
+  group_by(Cluster)%>%
+  summarise(
+    N=n(),Avg_Income=round(mean(Income),0),Avg_Spent=round(mean(TotalSpent),0),Avg_Recency=round(mean(Recency),1),
+    Avg_WebVisits=round(mean(NumWebVisitsMonth),1)
+  )%>%
+  knitr::kable(caption="Cluster profiles: average values by segment")
+```
+
+The numbers confirm the structure and with the PCA patterns help us to create actionable insights: the cluster with the highest income and total spent is the premium tier, these are the customers who buy the most and probably prefer a more personal or exclusive experience. The one with the most web visits and the lowest spending is the browser tier, they click a lot but rarely convert, so they represent untapped potential while the middle cluster sits in between on all metrics, forming the stable core of the customer base. From a marketing perspective, each of these three tiers calls for a different approach: premium customers might respond well to loyalty programs and early access to limited editions, middle customers are good for up-selling and cross-selling promotions, browsers need incentives, perhaps a first-purchase discount or free shipping, to turn their curiosity into actual sales.
+
+\newpage
+
+# Part 2: supervised learning
+
+For the predictive models, the dataset was split 80/20 into train and test sets, the split was stratified on the `ResponseTarget` variable, so the proportion of yes and no stays the same in both sets. I used 5-fold cross-validation on the training data to stop the models from overfitting. During cross-validation, up-sampling was applied to handle the class imbalance (about 15% positive responses).
+
+```{r supervised-setup, results='hide'}
+set.seed(123)
+trainIndex=createDataPartition(df_clean$ResponseTarget,p=0.8,list=FALSE)
+
+# forcing to pure data frame to avoid  upsampling bug
+train_data=as.data.frame(df_clean[trainIndex,])
+test_data=as.data.frame(df_clean[-trainIndex,])
+
+cv_control=trainControl(method="cv",number=5,classProbs=TRUE,summaryFunction=twoClassSummary,sampling="up")
+
+set.seed(123)
+log_model=train(ResponseTarget~.,data=train_data,method="glm",family="binomial",metric="ROC",trControl=cv_control)
+
+set.seed(123)
+lasso_model=train(ResponseTarget~.,data=train_data,method="glmnet",preProcess=c("center","scale"),
+                  tuneGrid=expand.grid(alpha=1,lambda=seq(0.01,0.1,0.02)),metric="ROC",trControl=cv_control)
+
+set.seed(123)
+rf_model=train(ResponseTarget~.,data=train_data,method="rf",metric="ROC",trControl=cv_control,tuneLength=2)
+
+set.seed(123)
+ann_model=train(ResponseTarget~.,data=train_data, method="nnet",preProcess=c("center","scale"),metric="ROC",trControl=cv_control,trace=FALSE,tuneLength=2)
+```
+
+The artificial neural network (nnet) is a feedforward network with a single hidden layer, the number of hidden units was tuned between 1 and 3, and a weight decay penalty was also tuned to reduce the risk of overfitting. Training used back propagation and was embedded inside the cross-validation loop with up-sampled mini-batches. This simple architecture is enough to capture non-linear boundaries without being too heavy.
+
+## Feature importance
+I graphed the feature importance with the random forest model to see which variables matter most for predicting:
+
+```{r var-imp}
+# Variable importance
+plot(varImp(rf_model),top=10,main="Random forest: top 10 predictors")
+```
+
+The results are pretty clear: recency (days since last purchase) is the strongest sign someone will accept the campaign: this makes intuitive sense, if someone bought recently a product he is more engaged and more likely to respond to new offers, while if someone is not purchasing from a long time probably he is not interested in the store, making him less probable to convert by being exposed to a new campaign. Economic power, represented by variables like Income and TotalSpent, is also a very strong sign of conversion, if someone has a lot of money to spend there is less friction, less thought about the cost of the product involved. On the flip side, basic demographics don't matter much, this shows that a buying persona is not identified by his sec, age or others: how people behave matters way more than who they are demographically. That is a useful takeaway for the marketing team: focusing on recent shoppers and purchase amounts is more effective than segmenting by age or family status.
+
+
+## Model comparison
+The four models were checked based on their area under the ROC curve (AUC) during cross-validation:
+
+```{r model-compare}
+# Model comparison
+results=resamples(list(Logistic=log_model,Lasso=lasso_model,RandomForest=rf_model,ANN=ann_model))
+bwplot(results,main="Model comparison based on ROC (cross-validation)")
+```
+
+The random forest model does the best, having the highest median AUC and  stability, its box is tighter, meaning it performs consistently across the five folds without much variation. The linear models (logistic regression, lasso) have lower median values, which hints at non-linear patterns that simple linear equations miss. The ANN, although more flexible, shows much larger variance across folds: it's less reliable in production if the training data changes slightly.
+
+## Test set evaluation
+To see how it works in the real world, I tested the random forest model against the 20% holdout test set:
+
+```{r test-set-evaluation, echo=FALSE}
+# Test set evaluation at default threshold 0.5
+pred_rf=predict(rf_model,newdata=test_data)
+conf_mat=confusionMatrix(pred_rf,test_data$ResponseTarget,positive="Yes")
+conf_mat$table
+```
+
+Even though overall accuracy is high, the confusion matrix shows a common issue with unbalanced data: the model is a bit too careful, it's great at spotting customers who will ignore the campaign (high specificity), but it misses quite a few actual positive responses (low sensitivity). This conservative behavior is expected when the default threshold of 0.5 is used on a dataset with only about 15% positive cases.
+
+Since the cost of sending a digital offer is basically zero, it makes sense for the business to drop the probability threshold below 0.5: this catches more potential conversions, trading a small bump in false positives for better overall engagement.
+
+```{r threshold-adjustment}
+# Lower threshold to 0.3 to improve sensitivity
+prob_rf=predict(rf_model,newdata=test_data,type="prob")[,"Yes"]
+
+threshold=0.3
+pred_adjusted=factor(ifelse(prob_rf>=threshold,"Yes","No"),  levels=c("No","Yes"))
+
+conf_adjusted=confusionMatrix(pred_adjusted,test_data$ResponseTarget,positive="Yes")
+conf_adjusted$table
+
+cat("\nSensitivity at threshold 0.3:", round(conf_adjusted$byClass["Sensitivity"],3))
+cat("\nSpecificity at threshold 0.3:",round(conf_adjusted$byClass["Specificity"],3))
+```
+
+Dropping the threshold to 0.3 picks up a bigger share of real positive responses: sensitivity jumps while specificity goes down only a little, in this context that's fine; the extra false positives just mean sending an offer to a few more people who won't convert, which costs almost nothing. So the model becomes a practical screening tool that recovers revenue that would otherwise be lost.
+
+# Conclusions
+Using the same marketing approach for everyone is a waste of time: the clustering shows three different spending groups, so we need different strategies, plus, the random forest model proves that recent engagement beats demographic guesses. By running contact lists through this model, focusing on recency and past actions, and setting an appropriate probability threshold, marketing teams can drop acquisition costs and put their effort into the groups most likely to convert. The three clusters also suggest a simple game plan: reward the premium segment, grow the middle, and convert the browsers.
